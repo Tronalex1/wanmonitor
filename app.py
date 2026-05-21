@@ -416,7 +416,7 @@ _INDEX_HTML = """\
 # CONFIG
 # ===========================================================
 
-POLL_INTERVAL  = 10    # seconds between full poll cycles
+POLL_INTERVAL  = 2    # seconds between full poll cycles
 DROP_THRESHOLD = 4     # consecutive failures → DOWN
 TCP_TIMEOUT    = 2.0   # seconds per TCP probe attempt
 
