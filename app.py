@@ -2,6 +2,7 @@
 WAN Monitoring Dashboard — Web Edition
 Flask backend: pings all ISP links in background threads,
 exposes /api/status for the dashboard to poll every 3 s.
+Single-file: HTML is embedded as a string (no templates/ folder needed).
 """
 
 import os
@@ -13,9 +14,398 @@ import time
 from collections import deque
 from datetime import datetime
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
+
+# ===========================================================
+# DASHBOARD HTML  (embedded — no templates/ folder required)
+# ===========================================================
+
+_INDEX_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WAN Monitoring Dashboard</title>
+  <style>
+    /* ─── Reset & Base ─────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:      #0f172a;
+      --panel:   #1e293b;
+      --border:  #334155;
+      --accent:  #38bdf8;
+      --green:   #22c55e;
+      --amber:   #f59e0b;
+      --red:     #ef4444;
+      --fg:      #f1f5f9;
+      --fg2:     #94a3b8;
+      --ok-bg:   #0b2016;
+      --warn-bg: #241900;
+      --down-bg: #220a0a;
+      --init-bg: #1e293b;
+      --font:    'Consolas', 'Courier New', monospace;
+    }
+    html, body {
+      height: 100%; background: var(--bg); color: var(--fg);
+      font-family: var(--font); font-size: 14px; overflow: hidden;
+    }
+
+    /* ─── Layout ────────────────────────────────────────────── */
+    #app { display: flex; flex-direction: column; height: 100vh; }
+
+    /* ─── Header ────────────────────────────────────────────── */
+    #header {
+      background: var(--panel);
+      padding: 14px 24px;
+      display: flex; align-items: center; justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    #header .title-block h1 {
+      font-size: 18px; font-weight: bold; letter-spacing: 1px;
+      color: var(--fg);
+    }
+    #header .title-block p {
+      font-size: 11px; color: var(--fg2); margin-top: 3px;
+    }
+    #header .right { text-align: right; }
+    #clock { font-size: 11px; color: var(--fg2); margin-bottom: 6px; }
+    .stat-badges { display: flex; gap: 8px; justify-content: flex-end; }
+    .badge {
+      padding: 3px 10px; border-radius: 4px; font-size: 11px;
+      font-weight: bold; background: var(--border); color: var(--fg2);
+      min-width: 56px; text-align: center;
+    }
+    .badge.ok   { background: #0b2016; color: var(--green); }
+    .badge.warn { background: #241900; color: var(--amber); }
+    .badge.down { background: #220a0a; color: var(--red);   }
+
+    /* ─── Toolbar ───────────────────────────────────────────── */
+    #toolbar {
+      background: var(--panel);
+      padding: 8px 20px;
+      display: flex; align-items: center; gap: 8px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0; flex-wrap: wrap;
+    }
+    .pills { display: flex; gap: 6px; }
+    .pill {
+      padding: 4px 14px; border-radius: 4px; font-size: 11px;
+      font-weight: bold; cursor: pointer; border: 1px solid var(--border);
+      background: var(--border); color: var(--fg2);
+      transition: background .15s, color .15s;
+      font-family: var(--font);
+    }
+    .pill:hover { filter: brightness(1.2); }
+    .pill.active-all  { background: var(--accent); color: #0f172a; border-color: var(--accent); }
+    .pill.active-ok   { background: var(--green);  color: #0f172a; border-color: var(--green);  }
+    .pill.active-warn { background: var(--amber);  color: #0f172a; border-color: var(--amber);  }
+    .pill.active-down { background: var(--red);    color: #fff;    border-color: var(--red);    }
+
+    .search-wrap {
+      margin-left: auto; display: flex; align-items: center; gap: 8px;
+    }
+    .search-wrap label { font-size: 11px; color: var(--fg2); }
+    #search {
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 4px 10px; font-family: var(--font);
+      font-size: 12px; width: 200px; outline: none;
+    }
+    #search:focus { border-color: var(--accent); }
+
+    /* ─── Refresh indicator ─────────────────────────────────── */
+    #refresh-bar {
+      height: 2px; background: var(--border); position: relative;
+      flex-shrink: 0;
+    }
+    #refresh-prog {
+      height: 100%; background: var(--accent);
+      transition: width .1s linear;
+      width: 0%;
+    }
+
+    /* ─── Table wrapper ─────────────────────────────────────── */
+    #table-wrap {
+      flex: 1; overflow: auto; padding: 8px 12px 0;
+    }
+    table {
+      width: 100%; border-collapse: collapse; font-size: 13px;
+    }
+    thead th {
+      position: sticky; top: 0; z-index: 2;
+      background: var(--panel); color: var(--fg2);
+      font-size: 11px; font-weight: bold; letter-spacing: .5px;
+      padding: 8px 12px; text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr { border-bottom: 1px solid #1a2540; transition: filter .1s; }
+    tbody tr:hover { filter: brightness(1.15); }
+    tbody td { padding: 7px 12px; }
+
+    /* status rows */
+    tr.r-OK   { background: var(--ok-bg); }
+    tr.r-WARN { background: var(--warn-bg); }
+    tr.r-DOWN { background: var(--down-bg); }
+    tr.r-INIT { background: var(--init-bg); }
+
+    .tag {
+      display: inline-block; padding: 2px 8px; border-radius: 3px;
+      font-size: 11px; font-weight: bold; min-width: 56px; text-align: center;
+    }
+    .tag-OK   { background: #0f2518; color: var(--green); border: 1px solid #1a3d20; }
+    .tag-WARN { background: #2c1e00; color: var(--amber); border: 1px solid #4a3000; }
+    .tag-DOWN { background: #2a0a0a; color: var(--red);   border: 1px solid #4a1010; }
+    .tag-INIT { background: #1e293b; color: var(--fg2);   border: 1px solid var(--border); }
+
+    .lat { color: var(--accent); font-variant-numeric: tabular-nums; }
+    .loc { color: var(--fg); font-weight: bold; }
+    .ip  { color: var(--fg2); font-size: 12px; }
+    .isp { color: var(--fg); }
+    .ts  { color: var(--fg2); font-size: 12px; }
+    .up  { color: var(--fg2); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+    /* ─── Status bar ─────────────────────────────────────────── */
+    #statusbar {
+      background: var(--panel); border-top: 1px solid var(--border);
+      padding: 4px 20px;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 11px; color: var(--fg2);
+      flex-shrink: 0;
+    }
+    #conn-dot {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green); margin-right: 5px;
+      box-shadow: 0 0 6px var(--green);
+    }
+    #conn-dot.err { background: var(--red); box-shadow: 0 0 6px var(--red); }
+
+    /* ─── Empty / loading state ──────────────────────────────── */
+    #loading {
+      text-align: center; padding: 60px; color: var(--fg2); font-size: 13px;
+    }
+    .spinner {
+      display: inline-block; width: 20px; height: 20px; margin-bottom: 12px;
+      border: 2px solid var(--border); border-top-color: var(--accent);
+      border-radius: 50%; animation: spin .7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Scrollbar ──────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Header ─────────────────────────────────────────────── -->
+  <div id="header">
+    <div class="title-block">
+      <h1>WAN MONITORING DASHBOARD</h1>
+      <p>Real-time link health across all sites</p>
+    </div>
+    <div class="right">
+      <div id="clock">—</div>
+      <div class="stat-badges">
+        <span class="badge ok"   id="b-ok">  OK  0</span>
+        <span class="badge warn" id="b-warn">WARN 0</span>
+        <span class="badge down" id="b-down">DOWN 0</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Toolbar ────────────────────────────────────────────── -->
+  <div id="toolbar">
+    <div class="pills">
+      <button class="pill active-all" data-f="ALL"  onclick="setFilter('ALL')">ALL  <span id="c-ALL">0</span></button>
+      <button class="pill"            data-f="OK"   onclick="setFilter('OK')">OK  <span id="c-OK">0</span></button>
+      <button class="pill"            data-f="WARN" onclick="setFilter('WARN')">WARN  <span id="c-WARN">0</span></button>
+      <button class="pill"            data-f="DOWN" onclick="setFilter('DOWN')">DOWN  <span id="c-DOWN">0</span></button>
+    </div>
+    <div class="search-wrap">
+      <label for="search">Search:</label>
+      <input id="search" type="text" placeholder="location / IP / ISP…"
+             oninput="applyView()" autocomplete="off" />
+    </div>
+  </div>
+
+  <!-- ── Refresh progress ──────────────────────────────────── -->
+  <div id="refresh-bar"><div id="refresh-prog"></div></div>
+
+  <!-- ── Table ──────────────────────────────────────────────── -->
+  <div id="table-wrap">
+    <div id="loading">
+      <div class="spinner"></div><br>Connecting to monitor…
+    </div>
+    <table id="tbl" style="display:none">
+      <thead>
+        <tr>
+          <th>LOCATION</th>
+          <th>IP ADDRESS</th>
+          <th>ISP</th>
+          <th>STATUS</th>
+          <th>LATENCY</th>
+          <th>LAST OK</th>
+          <th>UPTIME</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- ── Status bar ─────────────────────────────────────────── -->
+  <div id="statusbar">
+    <span><span id="conn-dot"></span><span id="status-txt">Connecting…</span></span>
+    <span>Poll: 5 s · Drop threshold: 4</span>
+  </div>
+
+</div><!-- #app -->
+
+<script>
+  // ── State ───────────────────────────────────────────────────
+  let allLinks   = [];
+  let filterMode = 'ALL';
+  let pollTimer  = null;
+  let progTimer  = null;
+  const POLL_MS  = 5000;
+
+  // ── Clock ───────────────────────────────────────────────────
+  function tickClock() {
+    const now = new Date();
+    const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    const months = ['Jan','Feb','Mar','Apr','May','Jun',
+                    'Jul','Aug','Sep','Oct','Nov','Dec'];
+    const d = `${days[now.getDay()]}, ${String(now.getDate()).padStart(2,'0')} ${months[now.getMonth()]} ${now.getFullYear()}`;
+    const t = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+    document.getElementById('clock').textContent = `${d}   ${t}`;
+  }
+  setInterval(tickClock, 1000);
+  tickClock();
+
+  // ── Refresh progress bar ────────────────────────────────────
+  function startProgress() {
+    const bar   = document.getElementById('refresh-prog');
+    const start = Date.now();
+    clearInterval(progTimer);
+    bar.style.width = '0%';
+    progTimer = setInterval(() => {
+      const pct = Math.min(100, ((Date.now() - start) / POLL_MS) * 100);
+      bar.style.width = pct + '%';
+      if (pct >= 100) clearInterval(progTimer);
+    }, 80);
+  }
+
+  // ── Fetch status ─────────────────────────────────────────────
+  async function fetchStatus() {
+    try {
+      const res  = await fetch('/api/status');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      allLinks   = data.links;
+      updateTable(data);
+      updateCounts(data.counts);
+      setConnected(true, data.updated);
+    } catch (e) {
+      setConnected(false, null);
+    }
+    startProgress();
+    pollTimer = setTimeout(fetchStatus, POLL_MS);
+  }
+
+  // ── Update table ─────────────────────────────────────────────
+  function updateTable(data) {
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('tbl').style.display     = '';
+    applyView();
+  }
+
+  function applyView() {
+    const q     = document.getElementById('search').value.trim().toLowerCase();
+    const tbody = document.getElementById('tbody');
+    tbody.innerHTML = '';
+
+    let shown = 0;
+    for (const lnk of allLinks) {
+      const health = lnk.health || 'INIT';
+      if (filterMode !== 'ALL' && health !== filterMode) continue;
+      if (q && !lnk.loc.toLowerCase().includes(q) &&
+              !lnk.ip.includes(q) &&
+              !lnk.isp.toLowerCase().includes(q)) continue;
+
+      const tr = document.createElement('tr');
+      tr.className = 'r-' + health;
+      tr.innerHTML = `
+        <td class="loc">${esc(lnk.loc)}</td>
+        <td class="ip">${esc(lnk.ip)}</td>
+        <td class="isp">${esc(lnk.isp)}</td>
+        <td><span class="tag tag-${health}">${health}</span></td>
+        <td class="lat">${esc(lnk.latency)}</td>
+        <td class="ts">${esc(lnk.last_ok)}</td>
+        <td class="up">${esc(lnk.uptime)}</td>`;
+      tbody.appendChild(tr);
+      shown++;
+    }
+
+    if (shown === 0) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="7" style="text-align:center;padding:30px;color:var(--fg2)">No links match the current filter.</td>`;
+      tbody.appendChild(tr);
+    }
+  }
+
+  function esc(s) {
+    if (!s) return '—';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Counts & badges ──────────────────────────────────────────
+  function updateCounts(counts) {
+    for (const k of ['ALL','OK','WARN','DOWN']) {
+      const el = document.getElementById('c-' + k);
+      if (el) el.textContent = counts[k] ?? 0;
+    }
+    document.getElementById('b-ok').textContent   = `OK  ${counts.OK   ?? 0}`;
+    document.getElementById('b-warn').textContent = `WARN  ${counts.WARN ?? 0}`;
+    document.getElementById('b-down').textContent = `DOWN  ${counts.DOWN ?? 0}`;
+  }
+
+  // ── Filter pills ─────────────────────────────────────────────
+  function setFilter(mode) {
+    filterMode = mode;
+    document.querySelectorAll('.pill').forEach(b => {
+      b.className = 'pill';
+      if (b.dataset.f === mode) b.classList.add('active-' + mode.toLowerCase());
+    });
+    applyView();
+  }
+
+  // ── Connection state ─────────────────────────────────────────
+  function setConnected(ok, ts) {
+    const dot = document.getElementById('conn-dot');
+    const txt = document.getElementById('status-txt');
+    dot.className = ok ? '' : 'err';
+    if (ok) {
+      const counts = {
+        ok:   allLinks.filter(l => l.health === 'OK').length,
+        warn: allLinks.filter(l => l.health === 'WARN').length,
+        down: allLinks.filter(l => l.health === 'DOWN').length,
+      };
+      txt.textContent = `MONITORING · Total: ${allLinks.length} · OK: ${counts.ok} · Warn: ${counts.warn} · Down: ${counts.down} · Updated: ${ts}`;
+    } else {
+      txt.textContent = 'Connection lost — retrying…';
+    }
+  }
+
+  // ── Bootstrap ────────────────────────────────────────────────
+  fetchStatus();
+</script>
+</body>
+</html>
+"""
 
 # ===========================================================
 # CONFIG
@@ -159,7 +549,7 @@ _monitor = Monitor()
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template_string(_INDEX_HTML)
 
 
 @app.route("/api/status")
