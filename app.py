@@ -10,9 +10,14 @@ import socket
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, jsonify, render_template_string
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    return datetime.now(_IST)
 
 app = Flask(__name__)
 
@@ -258,7 +263,7 @@ _INDEX_HTML = """\
   <!-- ── Status bar ─────────────────────────────────────────── -->
   <div id="statusbar">
     <span><span id="conn-dot"></span><span id="status-txt">Connecting…</span></span>
-    <span>TCP probe · Poll: 5 s · Drop threshold: 4</span>
+    <span>TCP probe · Poll: 10 s · Drop threshold: 4</span>
   </div>
 
 </div><!-- #app -->
@@ -269,16 +274,18 @@ _INDEX_HTML = """\
   let filterMode = 'ALL';
   let pollTimer  = null;
   let progTimer  = null;
-  const POLL_MS  = 5000;
+  const POLL_MS  = 10000;
 
-  // ── Clock ───────────────────────────────────────────────────
+  // ── Clock (IST = UTC+5:30) ──────────────────────────────────
   function tickClock() {
     const now = new Date();
-    const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    // Convert to IST by adding 5h30m to UTC
+    const ist = new Date(now.getTime() + (5 * 60 + 30) * 60000);
+    const days   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
     const months = ['Jan','Feb','Mar','Apr','May','Jun',
                     'Jul','Aug','Sep','Oct','Nov','Dec'];
-    const d = `${days[now.getDay()]}, ${String(now.getDate()).padStart(2,'0')} ${months[now.getMonth()]} ${now.getFullYear()}`;
-    const t = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+    const d = `${days[ist.getUTCDay()]}, ${String(ist.getUTCDate()).padStart(2,'0')} ${months[ist.getUTCMonth()]} ${ist.getUTCFullYear()}`;
+    const t = `${String(ist.getUTCHours()).padStart(2,'0')}:${String(ist.getUTCMinutes()).padStart(2,'0')}:${String(ist.getUTCSeconds()).padStart(2,'0')}`;
     document.getElementById('clock').textContent = `${d}   ${t}`;
   }
   setInterval(tickClock, 1000);
@@ -409,7 +416,7 @@ _INDEX_HTML = """\
 # CONFIG
 # ===========================================================
 
-POLL_INTERVAL  = 5     # seconds between full poll cycles
+POLL_INTERVAL  = 10    # seconds between full poll cycles
 DROP_THRESHOLD = 4     # consecutive failures → DOWN
 TCP_TIMEOUT    = 2.0   # seconds per TCP probe attempt
 
@@ -541,7 +548,7 @@ class Monitor:
             lnk.results.append(ok)
             lnk.checks += 1
             if ok:
-                lnk.last_ok = datetime.now().strftime("%H:%M:%S")
+                lnk.last_ok = _now_ist().strftime("%H:%M:%S")
                 lnk.latency = latency
                 lnk.success += 1
             else:
@@ -561,7 +568,7 @@ class Monitor:
         return {
             "links":   links,
             "counts":  counts,
-            "updated": datetime.now().strftime("%H:%M:%S"),
+            "updated": _now_ist().strftime("%H:%M:%S"),
         }
 
 
