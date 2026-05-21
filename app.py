@@ -6,9 +6,7 @@ Single-file: HTML is embedded as a string (no templates/ folder needed).
 """
 
 import os
-import re
-import platform
-import subprocess
+import socket
 import threading
 import time
 from collections import deque
@@ -260,7 +258,7 @@ _INDEX_HTML = """\
   <!-- ── Status bar ─────────────────────────────────────────── -->
   <div id="statusbar">
     <span><span id="conn-dot"></span><span id="status-txt">Connecting…</span></span>
-    <span>Poll: 5 s · Drop threshold: 4</span>
+    <span>TCP probe · Poll: 5 s · Drop threshold: 4</span>
   </div>
 
 </div><!-- #app -->
@@ -411,9 +409,14 @@ _INDEX_HTML = """\
 # CONFIG
 # ===========================================================
 
-PING_INTERVAL  = 5      # seconds between full poll cycles
-DROP_THRESHOLD = 4      # consecutive failures → DOWN
-PING_TIMEOUT   = 1      # seconds per ping attempt
+POLL_INTERVAL  = 5     # seconds between full poll cycles
+DROP_THRESHOLD = 4     # consecutive failures → DOWN
+TCP_TIMEOUT    = 2.0   # seconds per TCP probe attempt
+
+# Ports tried in order — first one that responds (open OR refused) wins.
+# ConnectionRefused = host is UP, just that port is closed.
+# Timeout / unreachable = host may be DOWN.
+PROBE_PORTS = [80, 443, 22, 8080, 8443, 53, 25, 21]
 
 # ===========================================================
 # SITES
@@ -476,15 +479,46 @@ class Link:
         }
 
 # ===========================================================
-# MONITOR
+# TCP PROBE  (no ICMP / no ping binary required)
 # ===========================================================
 
-def _ping_cmd(ip: str) -> list:
-    """Return OS-appropriate ping command."""
-    if platform.system() == "Windows":
-        return ["ping", "-n", "1", "-w", str(PING_TIMEOUT * 1000), ip]
-    return ["ping", "-c", "1", "-W", str(PING_TIMEOUT), ip]
+def _tcp_probe(ip: str) -> tuple:
+    """
+    Try TCP connect to PROBE_PORTS in order.
+    Returns (alive: bool, latency_str: str).
 
+    Why TCP works in cloud containers:
+      - ConnectionRefusedError means the host replied → it's UP.
+      - A successful connect is obviously UP.
+      - Only a timeout or network-unreachable means DOWN.
+    """
+    for port in PROBE_PORTS:
+        t0  = time.perf_counter()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TCP_TIMEOUT)
+        try:
+            err = sock.connect_ex((ip, port))
+            ms  = (time.perf_counter() - t0) * 1000
+            sock.close()
+            # err == 0   → connected (port open)
+            # err == 111 → ECONNREFUSED on Linux  (port closed, but host replied)
+            # err == 10061 → WSAECONNREFUSED on Windows
+            if err in (0, 111, 10061):
+                return True, f"{ms:.0f} ms"
+        except ConnectionRefusedError:
+            ms = (time.perf_counter() - t0) * 1000
+            sock.close()
+            return True, f"{ms:.0f} ms"
+        except (socket.timeout, OSError):
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return False, "—"
+
+# ===========================================================
+# MONITOR
+# ===========================================================
 
 class Monitor:
     def __init__(self):
@@ -498,26 +532,17 @@ class Monitor:
             for lnk in list(self.links):
                 threading.Thread(target=self._probe,
                                  args=(lnk,), daemon=True).start()
-            time.sleep(PING_INTERVAL)
+            time.sleep(POLL_INTERVAL)
 
     def _probe(self, lnk: Link):
-        try:
-            r = subprocess.run(
-                _ping_cmd(lnk.ip),
-                capture_output=True, text=True, timeout=PING_TIMEOUT + 1
-            )
-            m  = re.search(r"time[=<]\s*([\d.]+)", r.stdout)
-            ok = bool(m)
-        except Exception:
-            ok = False
-            m  = None
+        ok, latency = _tcp_probe(lnk.ip)
 
         with self._lock:
             lnk.results.append(ok)
             lnk.checks += 1
             if ok:
                 lnk.last_ok = datetime.now().strftime("%H:%M:%S")
-                lnk.latency = f"{float(m.group(1)):.0f} ms"
+                lnk.latency = latency
                 lnk.success += 1
             else:
                 lnk.latency = "—"
