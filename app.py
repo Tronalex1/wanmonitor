@@ -6,7 +6,10 @@ Single-file: HTML is embedded as a string (no templates/ folder needed).
 """
 
 import os
+import platform
+import re
 import socket
+import subprocess
 import threading
 import time
 from collections import deque
@@ -416,14 +419,15 @@ _INDEX_HTML = """\
 # CONFIG
 # ===========================================================
 
-POLL_INTERVAL  = 2    # seconds between full poll cycles
+POLL_INTERVAL  = 10    # seconds between full poll cycles
 DROP_THRESHOLD = 4     # consecutive failures → DOWN
-TCP_TIMEOUT    = 2.0   # seconds per TCP probe attempt
+PING_TIMEOUT   = 1     # seconds for ICMP ping
+TCP_TIMEOUT    = 2.0   # seconds per TCP attempt
 
-# Ports tried in order — first one that responds (open OR refused) wins.
-# ConnectionRefused = host is UP, just that port is closed.
-# Timeout / unreachable = host may be DOWN.
-PROBE_PORTS = [80, 443, 22, 8080, 8443, 53, 25, 21]
+# TCP ports tried if ping is unavailable.
+# ConnectionRefused = host IS up (it replied with RST).
+# Timeout on all ports = host likely DOWN.
+PROBE_PORTS = [80, 443, 22, 23, 8080, 8443, 179, 53, 8888, 7]
 
 # ===========================================================
 # SITES
@@ -486,41 +490,85 @@ class Link:
         }
 
 # ===========================================================
-# TCP PROBE  (no ICMP / no ping binary required)
+# PROBE  — ICMP ping first, TCP socket fallback
 # ===========================================================
 
-def _tcp_probe(ip: str) -> tuple:
+def _ping(ip: str):
     """
-    Try TCP connect to PROBE_PORTS in order.
-    Returns (alive: bool, latency_str: str).
+    Try ICMP ping via subprocess.
+    Returns:
+      (True,  "N ms")  — host replied to ping
+      (False, "—")     — ping ran, but no reply (host down or filtered)
+      (None,  None)    — ping binary missing or no raw-socket permission
+    """
+    try:
+        if platform.system() == "Windows":
+            cmd = ["ping", "-n", "1", "-w", str(PING_TIMEOUT * 1000), ip]
+        else:
+            cmd = ["ping", "-c", "1", "-W", str(PING_TIMEOUT), ip]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=PING_TIMEOUT + 2)
+        m = re.search(r"time[=<]\s*([\d.]+)", r.stdout)
+        if m:
+            return True, f"{float(m.group(1)):.0f} ms"
+        return False, "—"          # ping ran but no reply
+    except FileNotFoundError:
+        return None, None           # no ping binary in this environment
+    except PermissionError:
+        return None, None           # raw socket blocked (some containers)
+    except Exception:
+        return False, "—"
 
-    Why TCP works in cloud containers:
-      - ConnectionRefusedError means the host replied → it's UP.
-      - A successful connect is obviously UP.
-      - Only a timeout or network-unreachable means DOWN.
+
+def _tcp(ip: str):
+    """
+    TCP socket probe — works everywhere without special privileges.
+    ConnectionRefused = host IS up (it sent back a RST packet).
+    Timeout on every port = host likely DOWN or fully firewalled.
     """
     for port in PROBE_PORTS:
-        t0  = time.perf_counter()
+        t0   = time.perf_counter()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(TCP_TIMEOUT)
         try:
             err = sock.connect_ex((ip, port))
             ms  = (time.perf_counter() - t0) * 1000
             sock.close()
-            # err == 0   → connected (port open)
-            # err == 111 → ECONNREFUSED on Linux  (port closed, but host replied)
-            # err == 10061 → WSAECONNREFUSED on Windows
+            # 0 = connected | 111 = ECONNREFUSED (Linux) | 10061 = WSAECONNREFUSED (Win)
             if err in (0, 111, 10061):
                 return True, f"{ms:.0f} ms"
         except ConnectionRefusedError:
             ms = (time.perf_counter() - t0) * 1000
-            sock.close()
+            try: sock.close()
+            except Exception: pass
             return True, f"{ms:.0f} ms"
         except (socket.timeout, OSError):
-            try:
-                sock.close()
-            except Exception:
-                pass
+            try: sock.close()
+            except Exception: pass
+    return False, "—"
+
+
+def _check_host(ip: str):
+    """
+    Strategy:
+      1. ICMP ping  — best for routers/gateways that respond only to ICMP
+      2. If ping says UP → done
+      3. If ping unavailable (container restriction) → TCP only
+      4. If ping says DOWN → also try TCP (some hosts block ICMP but allow TCP)
+    """
+    ping_ok, ping_lat = _ping(ip)
+
+    if ping_ok is True:            # ping confirmed UP
+        return True, ping_lat
+
+    if ping_ok is None:            # ping not available → rely on TCP
+        return _tcp(ip)
+
+    # ping available but timed out: try TCP before declaring DOWN
+    tcp_ok, tcp_lat = _tcp(ip)
+    if tcp_ok:
+        return True, tcp_lat
+
     return False, "—"
 
 # ===========================================================
@@ -542,7 +590,7 @@ class Monitor:
             time.sleep(POLL_INTERVAL)
 
     def _probe(self, lnk: Link):
-        ok, latency = _tcp_probe(lnk.ip)
+        ok, latency = _check_host(lnk.ip)
 
         with self._lock:
             lnk.results.append(ok)
